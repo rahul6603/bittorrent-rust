@@ -9,6 +9,10 @@ use std::{
     fs,
     net::{Ipv4Addr, SocketAddrV4},
 };
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+};
 use url::form_urlencoded;
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -108,13 +112,34 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         })
                         .collect();
                     for addr in socket_addresses {
-                        println!("{}", addr.to_string());
+                        println!("{}", addr);
                     }
                 }
                 TrackerResponse::Failure { failure_reason } => {
                     eprintln!("Tracker error: {failure_reason}");
                 }
             }
+        }
+        "handshake" => {
+            let torrent_file = &args[2];
+            let decoded_contents = get_torrent_file_info(torrent_file)?;
+            let bencoded_info = serde_bencode::to_bytes(&decoded_contents.info)?;
+            let bencoded_info_hash = generate_hash(&bencoded_info);
+
+            let peer_socket_addr = &args[3];
+            let mut stream = TcpStream::connect(peer_socket_addr).await?;
+            let mut handshake_msg = [0u8; 68];
+            handshake_msg[0] = 19u8;
+            handshake_msg[1..20].copy_from_slice(b"BitTorrent protocol");
+            handshake_msg[20..28].copy_from_slice(&[0u8; 8]);
+            handshake_msg[28..48].copy_from_slice(&bencoded_info_hash);
+            handshake_msg[48..68].copy_from_slice(&generate_peer_id());
+            stream.write_all(&handshake_msg).await?;
+
+            let mut handshake_buf = [0u8; 68];
+            stream.read_exact(&mut handshake_buf).await?;
+            let peer_id = &handshake_buf[48..68];
+            println!("Peer ID: {}", hex::encode(peer_id));
         }
         _ => println!("unknown command: {}", args[1]),
     }
