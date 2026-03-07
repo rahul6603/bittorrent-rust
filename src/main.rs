@@ -4,8 +4,8 @@ use crate::{
     utils::{bencode_to_json, generate_hash},
 };
 use anyhow::Result;
+use clap::{Parser, Subcommand};
 use serde_bencode::{self, value::Value as BencodeValue};
-use std::env;
 
 mod download;
 mod peer;
@@ -13,21 +13,56 @@ mod torrent;
 mod tracker;
 mod utils;
 
+#[derive(Parser)]
+#[command(
+    author,
+    version,
+    about = "A minimal BitTorrent client implementation in Rust"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Decode a bencoded string
+    Decode {
+        /// The bencoded string to decode
+        value: String,
+    },
+    /// Show torrent file information
+    Info {
+        /// Path to the torrent file
+        torrent_file: String,
+    },
+    /// List peers for a torrent
+    Peers {
+        /// Path to the torrent file
+        torrent_file: String,
+    },
+    /// Download a file from a torrent
+    Download {
+        /// Output file path
+        #[arg(short)]
+        o: String,
+        /// Path to the torrent file
+        torrent_file: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args: Vec<String> = env::args().collect();
-    let command = &args[1];
+    let cli = Cli::parse();
 
-    match command.as_str() {
-        "decode" => {
-            let bencoded_contents = &args[2];
-            let decoded_contents: BencodeValue = serde_bencode::from_str(bencoded_contents)?;
+    match cli.command {
+        Command::Decode { value } => {
+            let decoded_contents: BencodeValue = serde_bencode::from_str(&value)?;
             let decoded_json = serde_json::to_string_pretty(&bencode_to_json(decoded_contents))?;
             println!("{decoded_json}");
         }
-        "info" => {
-            let torrent_file = &args[2];
-            let decoded_contents = get_torrent_file_info(torrent_file).await?;
+        Command::Info { torrent_file } => {
+            let decoded_contents = get_torrent_file_info(&torrent_file).await?;
             let bencoded_info = serde_bencode::to_bytes(&decoded_contents.info)?;
             let bencoded_info_hash_hex = hex::encode(generate_hash(&bencoded_info));
 
@@ -41,19 +76,15 @@ async fn main() -> Result<()> {
                 println!("{}", hex::encode(chunk))
             }
         }
-        "peers" => {
-            let torrent_file = &args[2];
-            let peer_addr_list = get_peer_list(torrent_file).await?;
+        Command::Peers { torrent_file } => {
+            let peer_addr_list = get_peer_list(&torrent_file).await?;
             for peer_addr in peer_addr_list {
                 println!("{peer_addr}");
             }
         }
-        "download" => {
-            let download_path = &args[3];
-            let torrent_file = &args[4];
-            download::handle_file_download(torrent_file, download_path).await?;
+        Command::Download { o, torrent_file } => {
+            download::handle_file_download(&torrent_file, &o).await?;
         }
-        _ => println!("unknown command: {}", args[1]),
     }
     Ok(())
 }
