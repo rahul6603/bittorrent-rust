@@ -1,11 +1,7 @@
-use crate::{
-    torrent::get_torrent_file_info,
-    tracker::get_peer_list,
-    utils::{bencode_to_json, generate_hash},
-};
+use crate::{torrent::get_torrent_file_info, tracker::get_peer_list, utils::generate_hash};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use serde_bencode::{self, value::Value as BencodeValue};
+use serde_bencode::{self};
 
 mod download;
 mod peer;
@@ -26,11 +22,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Decode a bencoded string
-    Decode {
-        /// The bencoded string to decode
-        value: String,
-    },
     /// Show torrent file information
     Info {
         /// Path to the torrent file
@@ -56,11 +47,6 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Decode { value } => {
-            let decoded_contents: BencodeValue = serde_bencode::from_str(&value)?;
-            let decoded_json = serde_json::to_string_pretty(&bencode_to_json(decoded_contents))?;
-            println!("{decoded_json}");
-        }
         Command::Info { torrent_file } => {
             let decoded_contents = get_torrent_file_info(&torrent_file).await?;
             let bencoded_info = serde_bencode::to_bytes(&decoded_contents.info)?;
