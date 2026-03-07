@@ -6,12 +6,12 @@ use serde_json::{Value as JsonValue, json};
 use sha1::{Digest, Sha1};
 use std::{
     env,
-    fs::{self, File},
-    io::Write,
+    io::SeekFrom,
     net::{Ipv4Addr, SocketAddrV4},
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    fs::{self, File, OpenOptions},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     net::TcpStream,
 };
 use url::form_urlencoded;
@@ -59,14 +59,16 @@ async fn main() -> Result<()> {
         }
         "info" => {
             let torrent_file = &args[2];
-            let decoded_contents = get_torrent_file_info(torrent_file)?;
+            let decoded_contents = get_torrent_file_info(torrent_file).await?;
             let bencoded_info = serde_bencode::to_bytes(&decoded_contents.info)?;
-            let bencoded_info_hash = generate_hash_hex(&bencoded_info);
+            let bencoded_info_hash_hex = hex::encode(generate_hash(&bencoded_info));
+
             println!("Tracker URL: {}", decoded_contents.announce);
             println!("Length: {}", decoded_contents.info.length);
-            println!("Info Hash: {}", bencoded_info_hash);
+            println!("Info Hash: {}", bencoded_info_hash_hex);
             println!("Piece Length: {}", decoded_contents.info.piece_length);
             println!("Piece Hashes:");
+
             for chunk in decoded_contents.info.pieces.chunks_exact(20) {
                 println!("{}", hex::encode(chunk))
             }
@@ -78,48 +80,29 @@ async fn main() -> Result<()> {
                 println!("{peer_addr}");
             }
         }
-        "handshake" => {
-            let torrent_file = &args[2];
-            let peer_addr = &args[3].parse::<SocketAddrV4>()?;
-            let mut stream = perform_handshake(torrent_file, peer_addr).await?;
-            let mut handshake_buf = [0u8; 68];
-            stream.read_exact(&mut handshake_buf).await?;
-            let mut peer_id = [0u8; 20];
-            peer_id.copy_from_slice(&handshake_buf[48..68]);
-            println!("Peer ID: {}", hex::encode(peer_id));
-        }
-        "download_piece" => {
+        "download" => {
             let download_path = &args[3];
             let torrent_file = &args[4];
-            let piece_idx = &args[5].parse::<u32>()?;
-            handle_piece_download(torrent_file, piece_idx, download_path).await?;
+            handle_file_download(torrent_file, download_path).await?;
         }
         _ => println!("unknown command: {}", args[1]),
     }
     Ok(())
 }
 
-async fn handle_piece_download(
-    torrent_file: &str,
-    piece_idx: &u32,
-    download_path: &str,
-) -> Result<()> {
-    let decoded_contents = get_torrent_file_info(torrent_file)?;
-    let pieces_hash = decoded_contents.info.pieces;
-    let num_pieces = pieces_hash.len() / 20;
-    if *piece_idx as usize >= num_pieces {
-        bail!(
-            "piece_idx {} out of range (total: {})",
-            piece_idx,
-            num_pieces
-        );
-    }
+async fn handle_file_download(torrent_file: &str, download_path: &str) -> Result<()> {
+    let decoded_contents = get_torrent_file_info(torrent_file).await?;
     let peer_addr_list = &get_peer_list(torrent_file).await?;
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(download_path)
+        .await?;
+    file.set_len(decoded_contents.info.length).await?;
+
     let mut stream = choose_peer(torrent_file, peer_addr_list).await?;
-
-    let mut handshake_response = [0u8; 68];
-    stream.read_exact(&mut handshake_response).await?;
-
     let mut buf = [0u8; 4];
     stream.read_exact(&mut buf).await?;
     let msg_length = u32::from_be_bytes(buf) as usize;
@@ -148,15 +131,50 @@ async fn handle_piece_download(
         bail!("Expected an unchoke message")
     }
 
+    let pieces_hash = &decoded_contents.info.pieces;
+    if pieces_hash.len() % 20 != 0 {
+        bail!("Invalid pieces field in torrent file: length not a multiple of 20");
+    }
+    let num_pieces = pieces_hash.len() / 20;
+
+    for idx in 0..num_pieces {
+        handle_piece_download(
+            &decoded_contents,
+            &mut stream,
+            &mut file,
+            idx as u32,
+            num_pieces as u32,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn handle_piece_download(
+    decoded_contents: &TorrentFile,
+    stream: &mut TcpStream,
+    file: &mut File,
+    piece_idx: u32,
+    num_pieces: u32,
+) -> Result<()> {
+    let pieces_hash = &decoded_contents.info.pieces;
+    if piece_idx >= num_pieces {
+        bail!(
+            "piece_idx {} out of range (total: {})",
+            piece_idx,
+            num_pieces
+        );
+    }
+
     let length = decoded_contents.info.length;
     let piece_length = decoded_contents.info.piece_length;
-    let piece_length = if *piece_idx as u64 == length / piece_length as u64 {
+    let actual_piece_length = if piece_idx == num_pieces as u32 - 1 {
         (length % piece_length as u64) as u32
     } else {
         piece_length
     };
     let block_size = 2u32.pow(14);
-    let num_blocks = piece_length.div_ceil(block_size);
+    let num_blocks = actual_piece_length.div_ceil(block_size);
     for idx in 0..num_blocks {
         let mut request_msg = [0u8; 17];
         request_msg[0..4].copy_from_slice(&13u32.to_be_bytes());
@@ -165,7 +183,7 @@ async fn handle_piece_download(
         let begin = idx * block_size;
         request_msg[9..13].copy_from_slice(&begin.to_be_bytes());
         let length = if idx == num_blocks - 1 {
-            piece_length - begin
+            actual_piece_length - begin
         } else {
             block_size
         };
@@ -173,9 +191,9 @@ async fn handle_piece_download(
         stream.write_all(&request_msg).await?;
     }
 
-    let mut piece_buffer = vec![0u8; piece_length as usize];
+    let mut piece_buffer = vec![0u8; actual_piece_length as usize];
     let mut bytes_received = 0;
-    while bytes_received < piece_length {
+    while bytes_received < actual_piece_length {
         let mut buf = [0u8; 4];
         stream.read_exact(&mut buf).await?;
         let msg_length = u32::from_be_bytes(buf) as usize;
@@ -193,13 +211,14 @@ async fn handle_piece_download(
         bytes_received += block_data.len() as u32;
     }
 
-    let hash_start_idx = *piece_idx as usize * 20;
+    let hash_start_idx = piece_idx as usize * 20;
     let piece_hash = &pieces_hash[hash_start_idx..hash_start_idx + 20];
-    if piece_hash != &generate_hash(&piece_buffer) {
+    if piece_hash != generate_hash(&piece_buffer) {
         bail!("Received piece does not match piece hash in the torrent file");
     }
-    let mut file = File::create(download_path)?;
-    file.write_all(&piece_buffer)?;
+    let offset = piece_idx as u64 * piece_length as u64;
+    file.seek(SeekFrom::Start(offset)).await?;
+    file.write_all(&piece_buffer).await?;
     Ok(())
 }
 
@@ -220,7 +239,7 @@ async fn choose_peer(torrent_file: &str, peer_addr_list: &[SocketAddrV4]) -> Res
 }
 
 async fn perform_handshake(torrent_file: &str, peer_addr: &SocketAddrV4) -> Result<TcpStream> {
-    let decoded_contents = get_torrent_file_info(torrent_file)?;
+    let decoded_contents = get_torrent_file_info(torrent_file).await?;
     let bencoded_info = serde_bencode::to_bytes(&decoded_contents.info)?;
     let bencoded_info_hash = generate_hash(&bencoded_info);
 
@@ -233,11 +252,14 @@ async fn perform_handshake(torrent_file: &str, peer_addr: &SocketAddrV4) -> Resu
     handshake_msg[48..68].copy_from_slice(&generate_peer_id());
     stream.write_all(&handshake_msg).await?;
 
+    let mut handshake_buf = [0u8; 68];
+    stream.read_exact(&mut handshake_buf).await?;
+
     Ok(stream)
 }
 
 async fn get_peer_list(torrent_file: &str) -> Result<Vec<SocketAddrV4>> {
-    let decoded_contents = get_torrent_file_info(torrent_file)?;
+    let decoded_contents = get_torrent_file_info(torrent_file).await?;
     let bencoded_info = serde_bencode::to_bytes(&decoded_contents.info)?;
     let bencoded_info_hash = generate_hash(&bencoded_info);
     let encoded_hash: String = form_urlencoded::byte_serialize(&bencoded_info_hash).collect();
@@ -307,17 +329,12 @@ fn bencode_to_json(bencoded_contents: BencodeValue) -> JsonValue {
     }
 }
 
-fn get_torrent_file_info(torrent_file: &str) -> Result<TorrentFile> {
-    let bencoded_contents = fs::read(torrent_file)?;
+async fn get_torrent_file_info(torrent_file: &str) -> Result<TorrentFile> {
+    let bencoded_contents = fs::read(torrent_file).await?;
     let decoded_contents = serde_bencode::from_bytes(&bencoded_contents)?;
     Ok(decoded_contents)
 }
 
 fn generate_hash(bencoded_info: &[u8]) -> [u8; 20] {
     Sha1::digest(bencoded_info).into()
-}
-
-fn generate_hash_hex(bencoded_info: &[u8]) -> String {
-    let hash = Sha1::digest(bencoded_info);
-    hex::encode(hash)
 }
