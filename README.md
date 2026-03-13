@@ -30,3 +30,7 @@ To build the binary:
 ```
 cargo build --release
 ```
+
+## Credits
+
+Built as part of the [CodeCrafters BitTorrent challenge](https://app.codecrafters.io/courses/bittorrent/overview).
